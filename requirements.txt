@@ -4,6 +4,7 @@ torchvision
 opencv-python-headless
 numpy
 segmentation-models-pytorch
+Pillow
 
 tqdm
 
