@@ -2,10 +2,18 @@ import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ["OMP_NUM_THREADS"] = "1"
 
-import sys
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-
 import streamlit as st
+import os
+import sys
+
+# --- 1. FORCE PYTHON TO LOOK IN CURRENT DIRECTORY ---
+# Get the absolute path of the folder containing this script
+current_dir = os.path.dirname(os.path.abspath(__file__))
+# Add it to the system path so Python can find 'inference_utils.py'
+if current_dir not in sys.path:
+    sys.path.append(current_dir)
+# ----------------------------------------------------
+
 import cv2
 import numpy as np
 import torch
@@ -13,15 +21,25 @@ from PIL import Image
 import io
 import zipfile
 
-# Import your custom utils (must be in the same folder)
-# We wrap this in a try-except block to prevent app crashing if utils are missing during setup
+# --- 2. ROBUST IMPORT WITH DEBUGGING ---
 try:
-    from Limbus_Crop_Segmentation_System.inference_utils import load_model, predict_masks
-except ImportError:
-    st.error("Could not import 'inference_utils'. Please ensure 'inference_utils.py' is in the same directory.")
+    from inference_utils import load_model, predict_masks
+except ImportError as e:
+    st.error("❌ Critical Error: Could not import 'inference_utils'.")
+    st.error(f"Python Error Details: {e}")
+    
+    # Debugging: Show user where Python is looking and what files it sees
+    st.warning(f"Script is running from: {current_dir}")
+    st.write("Files detected in this folder:", os.listdir(current_dir))
+    
+    # Stop execution here so you don't get the 'load_model not defined' error
+    st.stop()
 
 # ---------------- CONFIG ----------------
-DEFAULT_MODEL_PATH = "model_limbus_crop_unetpp_weighted.pth"
+DEFAULT_MODEL_PATH = os.path.join(current_dir, "model_limbus_crop_unetpp_weighted.pth")
+# ----------------------------------------
+
+
 # ----------------------------------------
 
 def crop_limbus(image_bgr, mask):
