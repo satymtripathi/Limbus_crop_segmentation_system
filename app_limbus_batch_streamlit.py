@@ -1,194 +1,149 @@
 import streamlit as st
+import os
 import cv2
 import numpy as np
 import torch
-import os
-import zipfile
-import io
 from PIL import Image
+import io
+import zipfile
 
-from inference_utils import (
-    load_model,
-    predict_masks,
-    draw_smooth_contours
-)
+# Import your custom utils (must be in the same folder)
+# We wrap this in a try-except block to prevent app crashing if utils are missing during setup
+try:
+    from inference_utils import load_model, predict_masks
+except ImportError:
+    st.error("Could not import 'inference_utils'. Please ensure 'inference_utils.py' is in the same directory.")
 
-# =======================
-# CONFIG
-# =======================
-MODEL_PATH = "model_limbus_crop_unetpp_weighted.pth"
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+# ---------------- CONFIG ----------------
+DEFAULT_MODEL_PATH = "model_limbus_crop_unetpp_weighted.pth"
+# ----------------------------------------
 
-st.set_page_config(layout="wide", page_title="Limbus Batch Segmentation")
+def crop_limbus(image_bgr, mask):
+    """
+    1. Applies the mask to the image (making background black).
+    2. Crops the image to the bounding rectangle of the limbus.
+    """
+    # Ensure mask is binary (0 or 255) and type uint8
+    mask = (mask * 255).astype(np.uint8) if mask.max() <= 1 else mask.astype(np.uint8)
+    
+    # 1. Apply mask to remove background
+    result = cv2.bitwise_and(image_bgr, image_bgr, mask=mask)
+    
+    # 2. Find bounding box to crop empty space
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    if not contours:
+        # If no limbus detected, return the original (or a black image)
+        return result 
+    
+    # Find the largest contour (assuming it's the limbus)
+    c = max(contours, key=cv2.contourArea)
+    x, y, w, h = cv2.boundingRect(c)
+    
+    # Crop
+    cropped_result = result[y:y+h, x:x+w]
+    return cropped_result
 
-# =======================
-# LOAD MODEL (CACHED)
-# =======================
 @st.cache_resource
-def load_segmentation_model():
-    return load_model(MODEL_PATH, DEVICE)
+def get_model(model_path, device):
+    """Load model only once using Streamlit caching."""
+    if not os.path.exists(model_path):
+        return None, None, None, None
+    return load_model(model_path, device)
 
-model, idx_crop, idx_limbus, img_size = load_segmentation_model()
+def main():
+    st.set_page_config(page_title="Limbus Cropper Tool", layout="wide")
+    st.title("👁️ Limbus Extraction & Cropping Tool")
 
-# =======================
-# LIMBUS TIGHT CROP
-# =======================
-def crop_limbus_tightly(image_bgr, limbus_mask, pad=5):
-    mask = (limbus_mask > 0).astype(np.uint8)
+    # --- Sidebar Configuration ---
+    st.sidebar.header("Configuration")
+    model_path = st.sidebar.text_input("Model Checkpoint Path", value=DEFAULT_MODEL_PATH)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    st.sidebar.write(f"**Running on:** `{device}`")
 
-    if mask.sum() == 0:
-        return None
+    # --- Load Model ---
+    try:
+        model, idx_crop, idx_limbus, img_size = get_model(model_path, device)
+        if model is None:
+            st.error(f"Model not found at `{model_path}`. Please check the path.")
+            st.stop()
+        else:
+            st.sidebar.success("Model loaded successfully!")
+    except Exception as e:
+        st.error(f"Error loading model: {e}")
+        st.stop()
 
-    ys, xs = np.where(mask > 0)
-    y1, y2 = ys.min(), ys.max()
-    x1, x2 = xs.min(), xs.max()
+    # --- File Upload ---
+    st.write("---")
+    uploaded_files = st.file_uploader(
+        "Upload Eye Images (Single or Batch)", 
+        type=["jpg", "jpeg", "png", "bmp", "tif"], 
+        accept_multiple_files=True
+    )
 
-    h, w = image_bgr.shape[:2]
-    y1 = max(0, y1 - pad)
-    y2 = min(h, y2 + pad)
-    x1 = max(0, x1 - pad)
-    x2 = min(w, x2 + pad)
+    if uploaded_files:
+        st.write(f"Processing **{len(uploaded_files)}** images...")
+        
+        # Container for results
+        processed_images = [] # List of (filename, image_array)
+        
+        progress_bar = st.progress(0)
+        
+        # Create columns for grid display
+        cols = st.columns(3) 
 
-    crop = image_bgr[y1:y2, x1:x2].copy()
-    crop_mask = mask[y1:y2, x1:x2]
+        for i, uploaded_file in enumerate(uploaded_files):
+            # 1. Read Image
+            file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
+            bgr_image = cv2.imdecode(file_bytes, 1)
+            
+            # 2. Predict
+            # Note: We assume predict_masks returns a numpy array of masks
+            masks = predict_masks(model, bgr_image, img_size, device)
+            
+            # 3. Process Limbus
+            limbus_mask = masks[idx_limbus] # Extract specific channel
+            
+            # Convert probability map to binary mask if necessary
+            if limbus_mask.dtype != np.uint8:
+                limbus_mask = (limbus_mask > 0.5).astype(np.uint8)
 
-    crop[crop_mask == 0] = 0
-    return crop
+            # Crop logic
+            cropped_limbus = crop_limbus(bgr_image, limbus_mask)
+            
+            # Convert BGR to RGB for Streamlit/PIL
+            cropped_rgb = cv2.cvtColor(cropped_limbus, cv2.COLOR_BGR2RGB)
+            
+            # Store result
+            filename = os.path.splitext(uploaded_file.name)[0] + "_limbus.png"
+            processed_images.append((filename, cropped_rgb))
 
-# =======================
-# PROCESS IMAGE
-# =======================
-def process_single_image(image_bgr):
-    masks = predict_masks(model, image_bgr, img_size, DEVICE)
-    limbus_mask = masks[idx_limbus]
+            # Display in grid (limit to first 9 to save memory/space in UI)
+            if i < 9:
+                with cols[i % 3]:
+                    st.image(cropped_rgb, caption=uploaded_file.name, use_container_width=True)
+            
+            progress_bar.progress((i + 1) / len(uploaded_files))
 
-    overlay = draw_smooth_contours(image_bgr, None, limbus_mask)
-    limbus_crop = crop_limbus_tightly(image_bgr, limbus_mask)
+        st.success("Processing Complete!")
 
-    return overlay, limbus_crop
+        # --- ZIP Download ---
+        if processed_images:
+            zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(zip_buffer, "w") as zf:
+                for fname, img_array in processed_images:
+                    # Convert numpy array back to bytes for zip
+                    pil_img = Image.fromarray(img_array)
+                    img_byte_arr = io.BytesIO()
+                    pil_img.save(img_byte_arr, format='PNG')
+                    zf.writestr(fname, img_byte_arr.getvalue())
+            
+            st.download_button(
+                label="📥 Download All Cropped Images (ZIP)",
+                data=zip_buffer.getvalue(),
+                file_name="limbus_crops.zip",
+                mime="application/zip"
+            )
 
-# =======================
-# ZIP CREATOR
-# =======================
-def create_zip_from_folder(folder_path):
-    zip_buffer = io.BytesIO()
-    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zipf:
-        for root, _, files in os.walk(folder_path):
-            for file in files:
-                full_path = os.path.join(root, file)
-                arcname = os.path.relpath(full_path, folder_path)
-                zipf.write(full_path, arcname)
-    zip_buffer.seek(0)
-    return zip_buffer
-
-# =======================
-# PASSPORT GRID
-# =======================
-def render_passport_grid(image_paths, thumb_size=96, cols=6):
-    if len(image_paths) == 0:
-        st.info("No limbus crops to preview")
-        return
-
-    rows = (len(image_paths) + cols - 1) // cols
-    for r in range(rows):
-        row_imgs = image_paths[r * cols:(r + 1) * cols]
-        columns = st.columns(cols)
-
-        for col, img_path in zip(columns, row_imgs):
-            img = Image.open(img_path).convert("RGB")
-            img = img.resize((thumb_size, thumb_size))
-            col.image(img)
-            col.caption(os.path.basename(img_path))
-
-# =======================
-# UI
-# =======================
-st.title("👁️ Limbus Segmentation – Batch Processor")
-st.markdown("**Tight limbus-only cropping · Passport preview · ZIP download**")
-
-mode = st.radio("Select Mode", ["Single Image", "Batch Folder"])
-
-# =======================
-# SINGLE IMAGE MODE
-# =======================
-if mode == "Single Image":
-    uploaded = st.file_uploader("Upload Eye Image", type=["jpg", "png", "jpeg"])
-
-    if uploaded:
-        image = cv2.imdecode(np.frombuffer(uploaded.read(), np.uint8), 1)
-        overlay, limbus_crop = process_single_image(image)
-
-        c1, c2, c3 = st.columns(3)
-
-        with c1:
-            st.image(cv2.cvtColor(image, cv2.COLOR_BGR2RGB), caption="Original")
-
-        with c2:
-            st.image(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB), caption="Limbus Overlay")
-
-        with c3:
-            if limbus_crop is not None:
-                st.image(cv2.cvtColor(limbus_crop, cv2.COLOR_BGR2RGB),
-                         caption="Tight Limbus Crop")
-            else:
-                st.warning("No limbus detected")
-
-# =======================
-# BATCH MODE
-# =======================
-else:
-    input_dir = st.text_input("Input Folder Path")
-    output_dir = st.text_input("Output Folder Path", "limbus_outputs")
-
-    show_grid = st.checkbox("Show passport grid preview", value=True)
-
-    if st.button("Run Batch Processing"):
-        os.makedirs(output_dir, exist_ok=True)
-
-        images = [
-            f for f in os.listdir(input_dir)
-            if f.lower().endswith((".jpg", ".png", ".jpeg"))
-        ]
-
-        progress = st.progress(0)
-        status = st.empty()
-
-        limbus_paths = []
-
-        for i, img_name in enumerate(images):
-            img_path = os.path.join(input_dir, img_name)
-            image = cv2.imread(img_path)
-
-            overlay, limbus_crop = process_single_image(image)
-            base = os.path.splitext(img_name)[0]
-
-            if overlay is not None:
-                cv2.imwrite(
-                    os.path.join(output_dir, f"{base}_overlay.png"),
-                    overlay
-                )
-
-            if limbus_crop is not None:
-                limbus_path = os.path.join(output_dir, f"{base}_limbus.png")
-                cv2.imwrite(limbus_path, limbus_crop)
-                limbus_paths.append(limbus_path)
-
-            progress.progress((i + 1) / len(images))
-            status.text(f"Processed {i + 1}/{len(images)}")
-
-        st.success("✅ Batch processing completed")
-
-        # GRID PREVIEW
-        if show_grid:
-            st.markdown("### 🪪 Limbus Passport Preview")
-            render_passport_grid(limbus_paths)
-
-        # ZIP DOWNLOAD
-        zip_buffer = create_zip_from_folder(output_dir)
-        st.download_button(
-            label="⬇️ Download ALL Results (ZIP)",
-            data=zip_buffer,
-            file_name="limbus_batch_outputs.zip",
-            mime="application/zip"
-        )
-
+if __name__ == "__main__":
+    main()
