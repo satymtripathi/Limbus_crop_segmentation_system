@@ -5,7 +5,7 @@ opencv-python-headless
 numpy
 segmentation-models-pytorch
 Pillow
-
+albumentations
 tqdm
 
 scipy
