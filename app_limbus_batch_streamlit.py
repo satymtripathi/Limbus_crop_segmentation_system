@@ -10,7 +10,7 @@ import zipfile
 # Import your custom utils (must be in the same folder)
 # We wrap this in a try-except block to prevent app crashing if utils are missing during setup
 try:
-    from inference_utils import load_model, predict_masks
+    from Limbus_crop_segmentation_system.inference_utils import load_model, predict_masks
 except ImportError:
     st.error("Could not import 'inference_utils'. Please ensure 'inference_utils.py' is in the same directory.")
 
